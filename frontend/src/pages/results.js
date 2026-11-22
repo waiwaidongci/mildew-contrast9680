@@ -18,8 +18,15 @@ export async function results(route, refresh) {
   const finished = item => item.status === 'complete' || item.status === 'failed';
   if (!finished(job)) {
     const original = location.hash;
-    const status = el('p',{role:'status'},'后台正在计算，完成后会自动展示。');
-    poll(()=>workspace.getRun(id),finished,()=>location.hash===original)
+    const status = el('p',{role:'status'});
+    const paint = item => {
+      const progress = item && item.progress;
+      status.textContent = progress && progress.total
+        ? `后台正在计算：架位去重核查已核 ${progress.verified}/${progress.total} 个模式，全部核完才展示结果。`
+        : '后台正在计算，完成后会自动展示。';
+    };
+    paint(job);
+    poll(()=>workspace.getRun(id).then(item=>{paint(item);return item;}),finished,()=>location.hash===original)
       .then(result=>{if (result && status.isConnected && location.hash===original) refresh();
         else if(status.isConnected) status.textContent='仍在执行，请点击刷新检查。';})
       .catch(error=>{if(status.isConnected) status.textContent=error.message;});

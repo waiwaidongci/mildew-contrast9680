@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, or_, select
 from src.config.database import Session
 from src.constants.enums import Status
-from src.domain.analysis import analyze
+from src.domain.analysis import analyze, merge_robustness, robustness_report
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
@@ -12,6 +12,10 @@ from src.utils.exports import write_report
 from src.utils.time import now
 
 log = logging.getLogger(__name__)
+
+
+class StaleLease(Exception):
+    """租约已被其他进程接管，本次计算与断点写入作废。"""
 
 
 def materialize_due():
@@ -61,12 +65,41 @@ def claim():
         return job.id, job.attempt, records, job.params
 
 
+def _checkpoint_load(job_id, attempt):
+    """读取架位去重核查断点；租约易主时抛 StaleLease 让本次计算作废。"""
+    with Session.begin() as db:
+        job = db.get(Run, job_id)
+        if job is None or job.attempt != attempt or job.status != Status.RUNNING:
+            raise StaleLease
+        return dict((job.checkpoint or {}).get('robustness') or {})
+
+
+def _checkpoint_save(job_id, attempt, done, total):
+    """每核完一个模式落盘一次断点，后台中断后重新领取时从已核完的模式续跑。"""
+    with Session.begin() as db:
+        job = db.get(Run, job_id, with_for_update=True)
+        if job is None or job.attempt != attempt or job.status != Status.RUNNING:
+            raise StaleLease
+        job.checkpoint = {'robustness': done, 'total': total}
+
+
 def execute(lease):
     job_id, attempt, rows, params = lease
     result = export = failure = None
     try:
         result = analyze(rows, params)
+        done = _checkpoint_load(job_id, attempt)
+
+        def on_verified(key, verdict, total):
+            done[key] = verdict
+            _checkpoint_save(job_id, attempt, done, total)
+
+        report = robustness_report(rows, params, done=done, on_verified=on_verified)
+        if report:
+            merge_robustness(result, report)
         export = write_report(job_id, attempt, result)
+    except StaleLease:
+        return
     except ValueError as error:
         failure = str(error)[:500]
     except Exception:
@@ -82,6 +115,7 @@ def execute(lease):
         job.result = None if failure else result
         job.export_file = export
         job.error = failure
+        job.checkpoint = None
         record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure)
         if job.schedule_id:
             plan = db.get(Schedule, job.schedule_id)

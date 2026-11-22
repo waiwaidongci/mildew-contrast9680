@@ -1,3 +1,4 @@
+from src.constants.enums import Status
 from src.utils.time import iso
 
 
@@ -14,6 +15,10 @@ def run(item, detail=False):
                  'has_export': bool(item.export_file), 'error': item.error}
     if detail:
         item_view.update(params=item.params, result=item.result, review_note=item.review_note)
+        saved = item.checkpoint or {}
+        verified = saved.get('robustness') or {}
+        if item.status == Status.RUNNING and verified:
+            item_view['progress'] = {'verified': len(verified), 'total': saved.get('total')}
     return item_view
 
 
